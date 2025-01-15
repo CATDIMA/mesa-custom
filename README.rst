@@ -8,6 +8,15 @@ Source
 This repository lives at https://gitlab.freedesktop.org/mesa/mesa.
 Other repositories are likely forks, and code found there is not supported.
 
+This version was edited by me and now it has PowerVR drivers
+
+Dependencies
+------------
+
+clang
+llvm-14
+python3 and module mako
+libdrm
 
 Build & install
 ---------------
