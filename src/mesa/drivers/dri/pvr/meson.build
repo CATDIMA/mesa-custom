@@ -8,7 +8,8 @@ files_pvr = files(
   'pvrimage.h',
   'pvrmesa.h',
   'pvrutil.c',
-  'queue.h'
+  'queue.h',
+  'pvrcompat.c'
 )
 
 libpvr = static_library(

@@ -12,6 +12,8 @@
  *
  * Copyright (C) 1999-2007  Brian Paul   All Rights Reserved.
  *
+ * The contents of this file are subject to the MIT license as set out below.
+ *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
  * in the Software without restriction, including without limitation the rights
@@ -36,14 +38,15 @@
 #include <assert.h>
 
 #include "main/version.h"
+#include "main/errors.h"
 
 #include "imports.h"
+#include "dri_support.h"
 #include "dri_util.h"
 #include "glapi.h"
 #include "dispatch.h"
 #include "pvrmesa.h"
 
-#include "dri_support.h"
 
 /**
  * This is the default function we plug into all dispatch table slots
@@ -71,7 +74,7 @@ pvrdri_alloc_dispatch_table(void)
 	{
 		unsigned i;
 
-		for (i = 0; i < numEntries; i++)
+		for (i = 0; i < numEntries; i)
 		{
 			table[i] = (_glapi_proc) generic_nop;
 		}
@@ -88,22 +91,24 @@ pvrdri_get_dispatch_table_ptr(PVRDRIScreen *psPVRScreen, PVRDRIAPIType eAPI)
 {
 	switch (eAPI)
 	{
-		case PVRDRI_API_GL:
-			return &psPVRScreen->psPVROGLDispatch;
-			break;
 		case PVRDRI_API_GLES1:
 			return &psPVRScreen->psOGLES1Dispatch;
 			break;
 		case PVRDRI_API_GLES2:
 			return &psPVRScreen->psOGLES2Dispatch;
 			break;
-		default:
-			return NULL;
+		case PVRDRI_API_CL:
+			assert(!"OpenCL doesn't have a dispatch table");
+			break;
+		case PVRDRI_API_NONE:
+			assert(!"invalid API");
+			break;
 	}
+	return NULL;
 }
 
 /**
- * Return a pointer to the dispatch table of an API in PVRDRIScreen.
+ * Return a pointer to the dispatch table of an API.
  */
 static struct _glapi_table *
 pvrdri_get_dispatch_table(PVRDRIScreen *psPVRScreen, PVRDRIAPIType eAPI)
@@ -119,12 +124,6 @@ pvrdri_get_dispatch_table(PVRDRIScreen *psPVRScreen, PVRDRIAPIType eAPI)
 void
 pvrdri_free_dispatch_tables(PVRDRIScreen *psPVRScreen)
 {
-	if (psPVRScreen->psPVROGLDispatch != NULL)
-	{
-		free(psPVRScreen->psPVROGLDispatch);
-		psPVRScreen->psPVROGLDispatch = NULL;
-	}
-
 	if (psPVRScreen->psOGLES1Dispatch != NULL)
 	{
 		free(psPVRScreen->psOGLES1Dispatch);
@@ -190,7 +189,7 @@ pvrdri_set_mesa_dispatch(struct _glapi_table *psTable,
 {
 	unsigned i;
 
-	for (i = 0; i < uNumFuncs; i++)
+	for (i = 0; i < uNumFuncs; i)
 	{
 		const char *psFunc = PVRDRIGetAPIFunc(eAPI, i);
 

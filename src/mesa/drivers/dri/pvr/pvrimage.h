@@ -28,6 +28,45 @@
 #define __PVRIMAGE_H__
 #include "dri_support.h"
 
+/*functions prototypes*/
+
+__DRIimage *PVRDRICreateImageFromRenderbuffer2(__DRIcontext *context,
+					      int           renderbuffer,
+                                              void         *loaderPrivate,
+					      unsigned     *error);
+
+__DRIimage *PVRDRICreateImageWithModifiers(__DRIscreen *screen,
+					   int width, int height, int format,
+					   const uint64_t *modifiers,
+					   const unsigned int modifier_count,
+					   void *loaderPrivate);
+
+__DRIimage *PVRDRICreateImageFromDmaBufs2(__DRIscreen *screen,
+					  int width, int height, int fourcc,
+					  uint64_t modifier,
+					  int *fds, int num_fds,
+					  int *strides, int *offsets,
+					  enum __DRIYUVColorSpace color_space,
+					  enum __DRISampleRange sample_range,
+					  enum __DRIChromaSiting horiz_siting,
+					  enum __DRIChromaSiting vert_siting,
+					  unsigned *error,
+					  void *loaderPrivate);
+
+void PVRDRIBlitImage(__DRIcontext *context,
+		     __DRIimage *dst, __DRIimage *src,
+		     int dstx0, int dsty0, int dstwidth, int dstheight,
+		     int srcx0, int srcy0, int srcwidth, int srcheight,
+		     int flush_flag);		
+
+int PVRDRIGetCapabilities(__DRIscreen *screen);			 			  	
+
+void *PVRDRIMapImage(__DRIcontext *context, __DRIimage *image,
+		    int x0, int y0, int width, int height,
+		    unsigned int flags, int *stride, void **data);
+
+void PVRDRIUnmapImage(__DRIcontext *context, __DRIimage *image, void *data);
+
 __DRIimage *PVRDRICreateImageFromName(__DRIscreen *screen,
 				      int width, int height, int format,
 				      int name, int pitch,

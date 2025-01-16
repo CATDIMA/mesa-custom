@@ -25,11 +25,12 @@
  */
 
 #include <assert.h>
-#include "xf86drm.h"
-#include "drm.h"
+#include <xf86drm.h>
 
+#include "util/u_atomic.h"
 #include "dri_util.h"
 
+#include "img_drm_fourcc.h"
 #include "pvrdri.h"
 #include "pvrimage.h"
 #include "EGL/egl.h"
@@ -50,6 +51,7 @@ struct PVRDRIImageShared
 	PVRDRIBufferImpl *psBuffer;
 	IMGEGLImage *psEGLImage;
 	PVRDRIEGLImageType eglImageType;
+	struct PVRDRIImageShared *psAncestor;
 };
 
 struct __DRIimageRec
@@ -65,8 +67,7 @@ struct __DRIimageRec
 
 
 static struct PVRDRIImageShared *
-CommonImageSharedSetup(PVRDRIImageType eType,
-                       __DRIscreen *screen)
+CommonImageSharedSetup(PVRDRIScreen *psPVRScreen, PVRDRIImageType eType)
 {
 	struct PVRDRIImageShared *shared;
 
@@ -76,7 +77,7 @@ CommonImageSharedSetup(PVRDRIImageType eType,
 		return NULL;
 	}
 
-	shared->psPVRScreen = DRIScreenPrivate(screen);
+	shared->psPVRScreen = psPVRScreen;
 	shared->eType = eType;
 	shared->iRefCount = 1;
 
@@ -89,7 +90,7 @@ CommonImageSharedSetup(PVRDRIImageType eType,
 
 static void DestroyImageShared(struct PVRDRIImageShared *shared)
 {
-	int iRefCount = __sync_sub_and_fetch(&shared->iRefCount, 1);
+	int iRefCount = p_atomic_dec_return(&shared->iRefCount);
 
 	assert(iRefCount >= 0);
 
@@ -107,17 +108,29 @@ static void DestroyImageShared(struct PVRDRIImageShared *shared)
 			{
 				PVRDRIBufferDestroy(shared->psBuffer);
 			}
-			break;
+			assert(!shared->psAncestor);
+			free(shared);
+			return;
 		case PVRDRI_IMAGE_FROM_EGLIMAGE:
 			PVRDRIEGLImageDestroyExternal(shared->psPVRScreen->psImpl,
 			                              shared->psEGLImage,
 						      shared->eglImageType);
-			break;
-		default:
-			errorMessage("%s: Unknown image type: %d\n", __func__, (int)shared->eType);
-			break;
+			free(shared);
+			return;
+		case PVRDRI_IMAGE_SUBIMAGE:
+			if (shared->psBuffer)
+			{
+				PVRDRIBufferDestroy(shared->psBuffer);
+			}
+			if (shared->psAncestor)
+			{
+				DestroyImageShared(shared->psAncestor);
+			}
+			free(shared);
+			return;
 	}
 
+	assert(!"unknown image type");
 	free(shared);
 }
 
@@ -126,19 +139,21 @@ CreateImageSharedFromEGLImage(__DRIscreen *screen,
                               IMGEGLImage *psEGLImage,
 			      PVRDRIEGLImageType eglImageType)
 {
+	PVRDRIScreen *psPVRScreen = DRIScreenPrivate(screen);
 	struct PVRDRIImageShared *shared;
 	PVRDRIBufferAttribs sAttribs;
 	const PVRDRIImageFormat *psFormat;
 
 	PVRDRIEGLImageGetAttribs(psEGLImage, &sAttribs);
 
-	psFormat = PVRDRIIMGPixelFormatToImageFormat(sAttribs.ePixFormat);
+	psFormat = PVRDRIIMGPixelFormatToImageFormat(psPVRScreen,
+						     sAttribs.ePixFormat);
 	if (!psFormat)
 	{
 		return NULL;
 	}
 
-	shared = CommonImageSharedSetup(PVRDRI_IMAGE_FROM_EGLIMAGE, screen);
+	shared = CommonImageSharedSetup(psPVRScreen, PVRDRI_IMAGE_FROM_EGLIMAGE);
 	if (!shared)
 	{
 		return NULL;
@@ -161,13 +176,14 @@ CreateImageSharedFromNames(__DRIscreen *screen,
 			   int *strides,
 			   int *offsets)
 {
+	PVRDRIScreen *psPVRScreen = DRIScreenPrivate(screen);
 	struct PVRDRIImageShared *shared;
 	const PVRDRIImageFormat *psFormat;
 	unsigned auiWidthShift[DRI_PLANES_MAX];
 	unsigned auiHeightShift[DRI_PLANES_MAX];
 	int i;
 
-	psFormat = PVRDRIFourCCToImageFormat(fourcc);
+	psFormat = PVRDRIFourCCToImageFormat(psPVRScreen, fourcc);
 	if (!psFormat)
 	{
 		errorMessage("%s: Unsupported DRI FourCC (fourcc = 0x%X)\n",
@@ -182,7 +198,7 @@ CreateImageSharedFromNames(__DRIscreen *screen,
 		return NULL;
 	}
 
-	for (i = 0; i < num_names; i++)
+	for (i = 0; i < num_names; i)
 	{
 		if (offsets[i] < 0)
 		{
@@ -195,13 +211,13 @@ CreateImageSharedFromNames(__DRIscreen *screen,
 		auiHeightShift[i] = psFormat->sPlanes[i].uiHeightShift;
 	}
 
-	shared = CommonImageSharedSetup(PVRDRI_IMAGE_FROM_NAMES, screen);
+	shared = CommonImageSharedSetup(psPVRScreen, PVRDRI_IMAGE_FROM_NAMES);
 	if (!shared)
 	{
 		return NULL;
 	}
 
-	shared->psBuffer = PVRDRIBufferCreateFromNames(shared->psPVRScreen->psImpl,
+	shared->psBuffer = PVRDRIBufferCreateFromNames(psPVRScreen->psImpl,
 						        width,
 						        height,
 						        num_names,
@@ -242,6 +258,7 @@ CreateImageSharedFromDmaBufs(__DRIscreen *screen,
 			     int width,
 			     int height,
 			     int fourcc,
+			     uint64_t modifier,
 			     int *fds,
 			     int num_fds,
 			     int *strides,
@@ -252,19 +269,39 @@ CreateImageSharedFromDmaBufs(__DRIscreen *screen,
 			     enum __DRIChromaSiting vert_siting,
 			     unsigned *error)
 {
+	PVRDRIScreen *psPVRScreen = DRIScreenPrivate(screen);
 	struct PVRDRIImageShared *shared;
 	const PVRDRIImageFormat *psFormat;
 	unsigned auiWidthShift[DRI_PLANES_MAX];
 	unsigned auiHeightShift[DRI_PLANES_MAX];
 	int i;
 
-	psFormat = PVRDRIFourCCToImageFormat(fourcc);
+	psFormat = PVRDRIFourCCToImageFormat(psPVRScreen, fourcc);
 	if (!psFormat)
 	{
 		errorMessage("%s: Unsupported DRI FourCC (fourcc = 0x%X)\n",
 			     __func__, fourcc);
 		*error = __DRI_IMAGE_ERROR_BAD_MATCH;
 		return NULL;
+	}
+
+	/* When a modifier isn't specified, skip the validation */
+	if (modifier != DRM_FORMAT_MOD_INVALID)
+	{
+		/*
+		 * The modifier validation has to be done in this "higher" level
+		 * function instead of pvr_dri_support. The support for
+		 * modifiers is done on per format basis, but there is no way
+		 * to pass the format information down to the plane creation API
+		 * in pvr_dri_support.
+		 */
+		if (!PVRDRIValidateImageModifier(psPVRScreen, fourcc, modifier))
+		{
+			errorMessage("%s: Unsupported mod (fmt = %#x, mod = %"PRIx64")\n",
+				     __func__, fourcc, modifier);
+			*error = __DRI_IMAGE_ERROR_BAD_MATCH;
+			return NULL;
+		}
 	}
 
 	if (psFormat->uiNumPlanes < num_fds)
@@ -275,7 +312,7 @@ CreateImageSharedFromDmaBufs(__DRIscreen *screen,
 		return NULL;
 	}
 
-	for (i = 0; i < num_fds; i++)
+	for (i = 0; i < num_fds; i)
 	{
 		if (offsets[i] < 0)
 		{
@@ -289,22 +326,23 @@ CreateImageSharedFromDmaBufs(__DRIscreen *screen,
 		auiHeightShift[i] = psFormat->sPlanes[i].uiHeightShift;
 	}
 
-	shared = CommonImageSharedSetup(PVRDRI_IMAGE_FROM_DMABUFS, screen);
+	shared = CommonImageSharedSetup(psPVRScreen, PVRDRI_IMAGE_FROM_DMABUFS);
 	if (!shared)
 	{
 		*error = __DRI_IMAGE_ERROR_BAD_ALLOC;
 		return NULL;
 	}
 
-	shared->psBuffer = PVRDRIBufferCreateFromFds(shared->psPVRScreen->psImpl,
-						      width,
-						      height,
-						      num_fds,
-						      fds,
-						      strides,
-						      offsets,
-						      auiWidthShift,
-						      auiHeightShift);
+	shared->psBuffer = PVRDRIBufferCreateFromFdsWithModifier(psPVRScreen->psImpl,
+								  width,
+								  height,
+								  modifier,
+								  num_fds,
+								  fds,
+								  strides,
+								  offsets,
+								  auiWidthShift,
+								  auiHeightShift);
 
 	if (!shared->psBuffer)
 	{
@@ -334,6 +372,7 @@ CreateImageShared(__DRIscreen *screen,
                   unsigned int use,
                   int *piStride)
 {
+	PVRDRIScreen *psPVRScreen = DRIScreenPrivate(screen);
 	struct PVRDRIImageShared *shared;
 	const PVRDRIImageFormat *psFormat;
 	unsigned int uiStride;
@@ -343,7 +382,7 @@ CreateImageShared(__DRIscreen *screen,
 		return NULL;
 	}
 
-	psFormat = PVRDRIFormatToImageFormat(format);
+	psFormat = PVRDRIFormatToImageFormat(psPVRScreen, format);
 	if (!psFormat)
 	{
 		errorMessage("%s: Unsupported DRI image format (format = 0x%X)\n",
@@ -351,14 +390,21 @@ CreateImageShared(__DRIscreen *screen,
 		return NULL;
 	}
 
-	shared = CommonImageSharedSetup(PVRDRI_IMAGE, screen);
+	if (psFormat->uiNumPlanes != 1)
+	{
+		errorMessage("%s: Only single plane formats are supported (format 0x%X has %u planes)\n",
+			     __func__, format, psFormat->uiNumPlanes);
+		return NULL;
+	}
+
+	shared = CommonImageSharedSetup(psPVRScreen, PVRDRI_IMAGE);
 	if (!shared)
 	{
 		return NULL;
 	}
 
 	shared->psBuffer =
-		PVRDRIBufferCreate(shared->psPVRScreen->psImpl,
+		PVRDRIBufferCreate(psPVRScreen->psImpl,
 				   width,
 				   height,
 				   PVRDRIPixFmtGetBPP(psFormat->eIMGPixelFormat),
@@ -382,14 +428,132 @@ ErrorDestroyImage:
 	return NULL;
 }
 
-static struct PVRDRIImageShared *RefImageShared(struct PVRDRIImageShared *shared)
+static struct PVRDRIImageShared *
+CreateImageSharedWithModifiers(__DRIscreen *screen,
+			       int width,
+			       int height,
+			       int format,
+			       const uint64_t *modifiers,
+			       unsigned int modifier_count,
+			       int *piStride)
 {
-	int iRefCount = __sync_fetch_and_add(&shared->iRefCount, 1);
+	PVRDRIScreen *psPVRScreen = DRIScreenPrivate(screen);
+	struct PVRDRIImageShared *shared;
+	const PVRDRIImageFormat *psFormat;
+	unsigned int uiStride;
 
-	(void)iRefCount;
-	assert(iRefCount > 0);
+	psFormat = PVRDRIFormatToImageFormat(psPVRScreen, format);
+	if (!psFormat)
+	{
+		errorMessage("%s: Unsupported DRI image format (format = 0x%X)\n",
+			     __func__, format);
+		return NULL;
+	}
+
+	shared = CommonImageSharedSetup(psPVRScreen, PVRDRI_IMAGE);
+	if (!shared)
+	{
+		return NULL;
+	}
+
+	shared->psBuffer = PVRDRIBufferCreateWithModifiers(psPVRScreen->psImpl,
+							   width,
+							   height,
+							   psFormat->iDRIFourCC,
+							   psFormat->eIMGPixelFormat,
+							   modifiers,
+							   modifier_count,
+							   &uiStride);
+	if (!shared->psBuffer)
+	{
+		errorMessage("%s: Failed to create buffer\n", __func__);
+		goto ErrorDestroyImage;
+	}
+
+	shared->psFormat = psFormat;
+
+	*piStride = uiStride;
 
 	return shared;
+
+ErrorDestroyImage:
+	DestroyImageShared(shared);
+
+	return NULL;
+}
+
+static struct PVRDRIImageShared *RefImageShared(struct PVRDRIImageShared *shared)
+{
+	int iRefCount = p_atomic_inc_return(&shared->iRefCount);
+
+	(void)iRefCount;
+	assert(iRefCount > 1);
+
+	return shared;
+}
+
+static struct PVRDRIImageShared *
+CreateImageSharedForSubImage(struct PVRDRIImageShared *psParent, int plane)
+{
+	struct PVRDRIImageShared *shared;
+	struct PVRDRIImageShared *psAncestor;
+	PVRDRIBufferImpl *psBuffer = NULL;
+
+	/* Sub-images represent a single plane in the parent image */
+	if (!psParent->psBuffer)
+	{
+		return NULL;
+	}
+
+	/*
+	 * The ancestor image is the owner of the original buffer that will
+	 * back the new image. The parent image may be a child of that image
+	 * itself. The ancestor image must not be destroyed until all the
+	 * child images that refer to it have been destroyed. A reference
+	 * will be taken on the ancestor to ensure that is the case.
+	 * We must distinguish between the parent's buffer and the ancestor's
+	 * buffer. For example, plane 0 in the parent is not necessarily plane
+	 * 0 in the ancestor.
+	 */
+	psAncestor = psParent;
+	if (psAncestor->psAncestor)
+	{
+		psAncestor = psAncestor->psAncestor;
+
+		assert(!psAncestor->psAncestor);
+	}
+
+	psBuffer = PVRDRISubBufferCreate(psParent->psPVRScreen->psImpl,
+					 psParent->psBuffer,
+					 plane);
+	/*
+	 * Older versions of PVR DRI Support don't support
+	 * PVRDRISubBufferCreate.
+	 */
+	if (!psBuffer)
+	{
+		return NULL;
+	}
+
+	shared = CommonImageSharedSetup(NULL, PVRDRI_IMAGE_SUBIMAGE);
+	if (!shared)
+	{
+		goto ErrorDestroyBuffer;
+	}
+
+	shared->psAncestor = RefImageShared(psAncestor);
+	shared->psBuffer = psBuffer;
+	shared->psPVRScreen = psParent->psPVRScreen;
+
+	shared->psFormat = PVRDRIIMGPixelFormatToImageFormat(psParent->psPVRScreen,
+							     psParent->psFormat->sPlanes[plane].eIMGPixelFormat);
+	assert(shared->psFormat);
+
+	return shared;
+
+ErrorDestroyBuffer:
+	PVRDRIBufferDestroy(psBuffer);
+	return NULL;
 }
 
 static __DRIimage *CommonImageSetup(void *loaderPrivate)
@@ -410,7 +574,7 @@ static __DRIimage *CommonImageSetup(void *loaderPrivate)
 
 void PVRDRIDestroyImage(__DRIimage *image)
 {
-	int iRefCount = __sync_sub_and_fetch(&image->iRefCount, 1);
+	int iRefCount = p_atomic_dec_return(&image->iRefCount);
 
 	assert(iRefCount >= 0);
 
@@ -434,11 +598,12 @@ __DRIimage *PVRDRICreateImageFromName(__DRIscreen *screen,
 				      int name, int pitch,
 				      void *loaderPrivate)
 {
+	PVRDRIScreen *psPVRScreen = DRIScreenPrivate(screen);
 	const PVRDRIImageFormat *psFormat;
 	int iStride;
 	int iOffset;
 
-	psFormat = PVRDRIFormatToImageFormat(format);
+	psFormat = PVRDRIFormatToImageFormat(psPVRScreen, format);
 	if (!psFormat)
 	{
 		errorMessage("%s: Unsupported DRI image format (format = 0x%X)\n",
@@ -453,9 +618,10 @@ __DRIimage *PVRDRICreateImageFromName(__DRIscreen *screen,
 					  &name, 1, &iStride, &iOffset, loaderPrivate);
 }
 
-__DRIimage *PVRDRICreateImageFromRenderbuffer(__DRIcontext *context,
-                                              int           renderbuffer,
-                                              void         *loaderPrivate)
+__DRIimage *PVRDRICreateImageFromRenderbuffer2(__DRIcontext *context,
+					      int           renderbuffer,
+                                              void         *loaderPrivate,
+					      unsigned     *error)
 {
 	PVRDRIContext *psPVRContext = context->driverPrivate;
 	__DRIscreen *screen = psPVRContext->psPVRScreen->psDRIScreen;
@@ -466,6 +632,7 @@ __DRIimage *PVRDRICreateImageFromRenderbuffer(__DRIcontext *context,
 	image = CommonImageSetup(loaderPrivate);
 	if (!image)
 	{
+		*error = __DRI_IMAGE_ERROR_BAD_ALLOC;
 		return NULL;
 	}
 
@@ -473,6 +640,8 @@ __DRIimage *PVRDRICreateImageFromRenderbuffer(__DRIcontext *context,
 	if (!psEGLImage)
 	{
 		PVRDRIDestroyImage(image);
+
+		*error = __DRI_IMAGE_ERROR_BAD_ALLOC;
 		return NULL;
 	}
 
@@ -488,11 +657,13 @@ __DRIimage *PVRDRICreateImageFromRenderbuffer(__DRIcontext *context,
 	{
 		PVRDRIEGLImageFree(psEGLImage);
 		PVRDRIDestroyImage(image);
+
+		*error = e;
 		return NULL;
 	}
 
 	PVRDRIEGLImageSetCallbackData(psEGLImage, image);
-
+	
 	/*
 	 * We can't destroy the image after this point, as the
 	 * renderbuffer now has a reference to it.
@@ -502,18 +673,33 @@ __DRIimage *PVRDRICreateImageFromRenderbuffer(__DRIcontext *context,
 							PVRDRI_EGLIMAGE_IMGEGL);
 	if (!image->psShared)
 	{
+		*error = __DRI_IMAGE_ERROR_BAD_ALLOC;
 		return NULL;
 	}
 
 	image->psEGLImage = PVRDRIEGLImageDup(image->psShared->psEGLImage);
 	if (!image->psEGLImage)
 	{
+		*error = __DRI_IMAGE_ERROR_BAD_ALLOC;
 		return NULL;
 	}
 
-	image->iRefCount++;
+	image->iRefCount;
 
+	*error = __DRI_IMAGE_ERROR_SUCCESS;
 	return image;
+}
+
+__DRIimage *PVRDRICreateImageFromRenderbuffer(__DRIcontext *context,
+                                              int           renderbuffer,
+                                              void         *loaderPrivate)
+{
+	unsigned error;
+
+	return PVRDRICreateImageFromRenderbuffer2(context,
+						  renderbuffer,
+						  loaderPrivate,
+						  &error);
 }
 
 __DRIimage *PVRDRICreateImage(__DRIscreen *screen,
@@ -541,7 +727,48 @@ __DRIimage *PVRDRICreateImage(__DRIscreen *screen,
 							    image->psShared->psFormat->eIMGPixelFormat,
 							    image->psShared->eColourSpace,
 							    image->psShared->eChromaUInterp,
+							    image->psShared->eChromaVInterp,
+							    image->psShared->psBuffer);
+	if (!image->psEGLImage)
+	{
+		PVRDRIDestroyImage(image);
+		return NULL;
+	}
+
+	PVRDRIEGLImageSetCallbackData(image->psEGLImage, image);
+
+	return image;
+}
+
+__DRIimage *PVRDRICreateImageWithModifiers(__DRIscreen *screen,
+					   int width, int height, int format,
+					   const uint64_t *modifiers,
+					   const unsigned int modifier_count,
+					   void *loaderPrivate)
+{
+	__DRIimage *image;
+	int iStride;
+
+	image = CommonImageSetup(loaderPrivate);
+	if (!image)
+	{
+		return NULL;
+	}
+
+	image->psShared = CreateImageSharedWithModifiers(screen, width, height, format,
+							 modifiers, modifier_count,
+							 &iStride);
+	if (!image->psShared)
+	{
+		PVRDRIDestroyImage(image);
+		return NULL;
+	}
+
+	image->psEGLImage = PVRDRIEGLImageCreateFromBuffer(width, height, iStride,
+							    image->psShared->psFormat->eIMGPixelFormat,
+							    image->psShared->eColourSpace,
 							    image->psShared->eChromaUInterp,
+							    image->psShared->eChromaVInterp,
 							    image->psShared->psBuffer);
 	if (!image->psEGLImage)
 	{
@@ -559,12 +786,14 @@ GLboolean PVRDRIQueryImage(__DRIimage *image, int attrib, int *value_ptr)
 	struct PVRDRIImageShared *shared = image->psShared;
 	PVRDRIBufferAttribs sAttribs;
 	int value;
+	uint64_t ulValue;
 
 	PVRDRIEGLImageGetAttribs(image->psEGLImage, &sAttribs);
 
 	if (attrib == __DRI_IMAGE_ATTRIB_HANDLE ||
 	    attrib == __DRI_IMAGE_ATTRIB_NAME ||
-	    attrib == __DRI_IMAGE_ATTRIB_FD)
+	    attrib == __DRI_IMAGE_ATTRIB_FD ||
+	    attrib == __DRI_IMAGE_ATTRIB_OFFSET)
 	{
 		if (!shared->psFormat)
 		{
@@ -577,6 +806,9 @@ GLboolean PVRDRIQueryImage(__DRIimage *image, int attrib, int *value_ptr)
 			case __DRI_IMAGE_COMPONENTS_RG:
 			case __DRI_IMAGE_COMPONENTS_RGB:
 			case __DRI_IMAGE_COMPONENTS_RGBA:
+#if defined(__DRI_IMAGE_COMPONENTS_EXTERNAL)
+			case __DRI_IMAGE_COMPONENTS_EXTERNAL:
+#endif
 				break;
 			default:
 				return GL_FALSE;
@@ -637,6 +869,23 @@ GLboolean PVRDRIQueryImage(__DRIimage *image, int attrib, int *value_ptr)
 
 			*value_ptr = value;
 			break;
+		case __DRI_IMAGE_ATTRIB_FOURCC:
+			*value_ptr = shared->psFormat->iDRIFourCC;
+			break;
+		case __DRI_IMAGE_ATTRIB_NUM_PLANES:
+			*value_ptr = (int)shared->psFormat->uiNumPlanes;
+			break;
+		case __DRI_IMAGE_ATTRIB_OFFSET:
+			*value_ptr = PVRDRIBufferGetOffset(shared->psBuffer);
+			break;
+		case __DRI_IMAGE_ATTRIB_MODIFIER_LOWER:
+			ulValue = PVRDRIBufferGetModifier(shared->psBuffer);
+			*value_ptr = (int)(ulValue & 0xffffffff);
+			break;
+		case __DRI_IMAGE_ATTRIB_MODIFIER_UPPER:
+			ulValue = PVRDRIBufferGetModifier(shared->psBuffer);
+			*value_ptr = (int)((ulValue >> 32) & 0xffffffff);
+			break;
 		default:
 			return GL_FALSE;
 	}
@@ -670,16 +919,27 @@ __DRIimage *PVRDRIDupImage(__DRIimage *srcImage, void *loaderPrivate)
 
 GLboolean PVRDRIValidateUsage(__DRIimage *image, unsigned int use)
 {
-	__DRIscreen *screen = image->psShared->psPVRScreen->psDRIScreen;
+	struct PVRDRIImageShared *shared = image->psShared;
+	__DRIscreen *screen = shared->psPVRScreen->psDRIScreen;
 
 	if (use & (__DRI_IMAGE_USE_SCANOUT | __DRI_IMAGE_USE_CURSOR))
 	{
+		uint64_t modifier;
+
 		/*
 		 * We are extra strict in this case as an application may ask for a
 		 * handle so that the memory can be wrapped as a framebuffer/used as
 		 * a cursor and this can only be done on a card node.
 		 */
 		if (drmGetNodeTypeFromFd(screen->fd) != DRM_NODE_PRIMARY)
+		{
+			return GL_FALSE;
+		}
+
+		modifier = PVRDRIBufferGetModifier(shared->psBuffer);
+
+		if (modifier != DRM_FORMAT_MOD_INVALID &&
+			modifier != DRM_FORMAT_MOD_LINEAR)
 		{
 			return GL_FALSE;
 		}
@@ -750,15 +1010,48 @@ __DRIimage *PVRDRICreateImageFromNames(__DRIscreen *screen,
 	return image;
 }
 
-__DRIimage *PVRDRIFromPlanar(__DRIimage *image, int plane,
+__DRIimage *PVRDRIFromPlanar(__DRIimage *srcImage, int plane,
 			     void *loaderPrivate)
 {
-	if (plane != 0)
+	__DRIimage *image;
+
+	image = CommonImageSetup(loaderPrivate);
+	if (!image)
 	{
-		errorMessage("%s: plane %d not supported\n", __func__, plane);
+		return NULL;
 	}
 
-	return PVRDRIDupImage(image, loaderPrivate);
+	image->psShared = CreateImageSharedForSubImage(srcImage->psShared,
+						       plane);
+
+	if (!image->psShared)
+	{
+		if (plane != 0)
+		{
+			errorMessage("%s: plane %d not supported\n",
+				     __func__, plane);
+		}
+
+		image->psShared = RefImageShared(srcImage->psShared);
+
+		image->psEGLImage = PVRDRIEGLImageDup(srcImage->psEGLImage);
+	}
+	else
+	{
+		image->psEGLImage = PVRDRIEGLImageCreateFromSubBuffer(
+					image->psShared->psFormat->eIMGPixelFormat,
+					image->psShared->psBuffer);
+	}
+
+	if (!image->psEGLImage)
+	{
+		PVRDRIDestroyImage(image);
+		return NULL;
+	}
+
+	PVRDRIEGLImageSetCallbackData(image->psEGLImage, image);
+
+	return image;
 }
 
 __DRIimage *
@@ -840,7 +1133,7 @@ PVRDRICreateImageFromTexture(__DRIcontext *context,
 		return NULL;
 	}
 
-	image->iRefCount++;
+	image->iRefCount;
 
 	return image;
 }
@@ -934,21 +1227,22 @@ PVRDRICreateImageFromBuffer(__DRIcontext *context,
 		return NULL;
 	}
 
-	image->iRefCount++;
+	image->iRefCount;
 
 	return image;
 }
 
-__DRIimage *PVRDRICreateImageFromDmaBufs(__DRIscreen *screen,
-                                         int width, int height, int fourcc,
-                                         int *fds, int num_fds,
-                                         int *strides, int *offsets,
-                                         enum __DRIYUVColorSpace color_space,
-                                         enum __DRISampleRange sample_range,
-                                         enum __DRIChromaSiting horiz_siting,
-                                         enum __DRIChromaSiting vert_siting,
-                                         unsigned *error,
-                                         void *loaderPrivate)
+__DRIimage *PVRDRICreateImageFromDmaBufs2(__DRIscreen *screen,
+					  int width, int height, int fourcc,
+					  uint64_t modifier,
+					  int *fds, int num_fds,
+					  int *strides, int *offsets,
+					  enum __DRIYUVColorSpace color_space,
+					  enum __DRISampleRange sample_range,
+					  enum __DRIChromaSiting horiz_siting,
+					  enum __DRIChromaSiting vert_siting,
+					  unsigned *error,
+					  void *loaderPrivate)
 {
 	__DRIimage *image;
 
@@ -960,6 +1254,7 @@ __DRIimage *PVRDRICreateImageFromDmaBufs(__DRIscreen *screen,
 	}
 
 	image->psShared = CreateImageSharedFromDmaBufs(screen, width, height, fourcc,
+						       modifier,
 						       fds, num_fds, strides, offsets,
 						       color_space, sample_range,
 						       horiz_siting, vert_siting,
@@ -991,12 +1286,36 @@ __DRIimage *PVRDRICreateImageFromDmaBufs(__DRIscreen *screen,
 	return image;
 }
 
+__DRIimage *PVRDRICreateImageFromDmaBufs(__DRIscreen *screen,
+                                         int width, int height, int fourcc,
+                                         int *fds, int num_fds,
+                                         int *strides, int *offsets,
+                                         enum __DRIYUVColorSpace color_space,
+                                         enum __DRISampleRange sample_range,
+                                         enum __DRIChromaSiting horiz_siting,
+                                         enum __DRIChromaSiting vert_siting,
+                                         unsigned *error,
+                                         void *loaderPrivate)
+{
+	return PVRDRICreateImageFromDmaBufs2(screen,
+					     width, height, fourcc,
+					     DRM_FORMAT_MOD_INVALID,
+					     fds, num_fds,
+					     strides, offsets,
+					     color_space,
+					     sample_range,
+					     horiz_siting,
+					     vert_siting,
+					     error,
+					     loaderPrivate);
+}
+
 void PVRDRIRefImage(__DRIimage *image)
 {
-	int iRefCount = __sync_fetch_and_add(&image->iRefCount, 1);
+	int iRefCount = p_atomic_inc_return(&image->iRefCount);
 
 	(void)iRefCount;
-	assert(iRefCount > 0);
+	assert(iRefCount > 1);
 }
 
 void PVRDRIUnrefImage(__DRIimage *image)
@@ -1040,4 +1359,62 @@ __DRIimage *PVRDRIScreenGetDRIImage(void *hEGLImage)
 	      psPVRScreen->psDRIScreen,
 	      hEGLImage,
 	      psPVRScreen->psDRIScreen->loaderPrivate);
+}
+
+void PVRDRIBlitImage(__DRIcontext *context,
+		     __DRIimage *dst, __DRIimage *src,
+		     int dstx0, int dsty0, int dstwidth, int dstheight,
+		     int srcx0, int srcy0, int srcwidth, int srcheight,
+		     int flush_flag)
+{
+	PVRDRIContext *psPVRContext = context->driverPrivate;
+	bool res;
+
+	res = PVRDRIBlitEGLImage(psPVRContext->psPVRScreen->psImpl,
+			psPVRContext->psImpl,
+			dst->psEGLImage, dst->psShared->psBuffer,
+			src->psEGLImage, src->psShared->psBuffer,
+			dstx0, dsty0, dstwidth, dstheight,
+			srcx0, srcy0, srcwidth, srcheight,
+			flush_flag);
+	
+
+	if (!res)
+	{
+		__driUtilMessage("%s: PVRDRIBlitEGLImage failed\n", __func__);
+	}
+}
+
+int PVRDRIGetCapabilities(__DRIscreen *screen)
+{
+	(void) screen;
+
+	return __DRI_IMAGE_CAP_GLOBAL_NAMES;
+}
+
+void *PVRDRIMapImage(__DRIcontext *context, __DRIimage *image,
+		    int x0, int y0, int width, int height,
+		    unsigned int flags, int *stride, void **data)
+{
+	PVRDRIContext *psPVRContext = context->driverPrivate;
+
+	return PVRDRIMapEGLImage(psPVRContext->psPVRScreen->psImpl,
+				 psPVRContext->psImpl,
+				 image->psEGLImage, image->psShared->psBuffer,
+				 x0, y0, width, height, flags, stride, data);
+}
+
+void PVRDRIUnmapImage(__DRIcontext *context, __DRIimage *image, void *data)
+{
+	PVRDRIContext *psPVRContext = context->driverPrivate;
+	bool res;
+
+	res = PVRDRIUnmapEGLImage(psPVRContext->psPVRScreen->psImpl,
+			      psPVRContext->psImpl,
+			      image->psEGLImage, image->psShared->psBuffer,
+			      data);
+	if (!res)
+	{
+		__driUtilMessage("%s: PVRDRIUnmapEGLImage failed\n", __func__);
+	}
 }
