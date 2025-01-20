@@ -9,7 +9,7 @@
 * pkg-config
 * cmake
 * meson=1.0.1-5
-* libdrm (в случае проблем с libdrm использовать версию 2.4.102)
+* libdrm2 и libdrm-dev (в случае проблем с libdrm использовать версию [2.4.102](https://gitlab.freedesktop.org/mesa/drm/-/tree/libdrm-2.4.102))
 * llvm-14, удалить llvm-19 на время сборки, иначе meson всегда будет использовать его  
 * libelf-dev
 * bison
